@@ -34,6 +34,43 @@ from collections import defaultdict
 
 API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 
+# ─── KANAL INDONESIA TARGET (Opsi B) ─────────────────────────────────────────
+# Channel ID didapat dari URL kanal YouTube masing-masing.
+# Format: youtube.com/channel/CHANNEL_ID atau youtube.com/@handle
+# Untuk verifikasi: buka kanal → About → Share → Copy channel ID
+#
+# TIER 1 — Kanal berita besar, audience luas, banyak komentar konflik luar negeri
+# 8 kanal dipilih berdasarkan: audience luas, aktif, banyak komentar berita luar negeri
+# Quota estimasi: 8 kanal × 3 query × 2 modul × 100 unit = 4.800 unit search
+#                 + ~270 video × 2 halaman × 1 unit = ~540 unit comments
+#                 Total: ~5.340 unit (aman di bawah 10.000/hari)
+INDONESIAN_CHANNELS = {
+    "Kompas TV":     "UCeGTFQJXSs7gFJSvM9K1rog",
+    "CNN Indonesia": "UCtbK_R7c_TrGTXQjMoAoaOg",
+    "tvOne":         "UC2T-HxGr5dMpEOz7YPRJm3w",
+    "Metro TV":      "UCuGnJLeMVFDWBOFtNKPk7zQ",
+    "detikcom":      "UCnewsRcNvNlDoAjqLGh4Epg",
+    "Narasi":        "UCpjX3QCOx4UZQ0BIkmrfG_g",
+    "Tempo.co":      "UCkFH-y5t5p9w5m9UFADhXUQ",
+    "Liputan6":      "UCjRdt28_GCZ9EXjFJqDN3gg",
+}
+
+# 3 query per kanal — cukup untuk menangkap video relevan tanpa buang quota
+QUERIES_PER_CHANNEL_SERANGAN = [
+    "iran israel serangan",
+    "khamenei",
+    "perang iran israel 2026",
+]
+
+QUERIES_PER_CHANNEL_EKONOMI = [
+    "selat hormuz minyak",
+    "harga minyak naik iran",
+    "dampak ekonomi iran indonesia",
+]
+
+MAX_VIDEOS_PER_CHANNEL_QUERY = 3   # 3 video per query per kanal
+MAX_COMMENTS_PER_VIDEO       = 200  # komentar per video
+
 # ── MODUL A: SERANGAN (Feb 28, 2026 — Khamenei tewas) ─────────────────────────
 # Semua query BAHASA INDONESIA — target: komentar publik Indonesia
 # relevanceLanguage="id" dipaksa untuk semua query
@@ -260,20 +297,20 @@ def get_youtube_client():
         return None
 
 
-def search_videos(youtube, query: str, max_results: int = 5,
-                  relevance_language: str = "id") -> list:
-    """Cari video; prioritaskan bahasa Indonesia."""
+def search_videos_in_channel(youtube, channel_id: str, channel_name: str,
+                              query: str, max_results: int = 3) -> list:
+    """Cari video di dalam satu kanal Indonesia spesifik."""
     try:
         resp = youtube.search().list(
             q=query,
             part="id,snippet",
+            channelId=channel_id,
             maxResults=max_results,
             type="video",
-            order="relevance",
-            relevanceLanguage=relevance_language,
+            order="date",          # terbaru dulu — relevan untuk kejadian 2026
         ).execute()
     except Exception as e:
-        print(f"  ⚠️  Search error '{query}': {e}")
+        print(f"    ⚠️  Search error [{channel_name}] '{query}': {e}")
         return []
 
     return [
@@ -281,11 +318,31 @@ def search_videos(youtube, query: str, max_results: int = 5,
             "video_id":    item["id"]["videoId"],
             "title":       item["snippet"]["title"],
             "channel":     item["snippet"]["channelTitle"],
+            "channel_id":  channel_id,
             "published_at": item["snippet"]["publishedAt"],
             "query":       query,
         }
         for item in resp.get("items", [])
         if item["id"].get("videoId")
+    ]
+
+
+def search_videos(youtube, query: str, max_results: int = 5,
+                  relevance_language: str = "id") -> list:
+    """Fallback: search global (tidak dipakai di Opsi B)."""
+    try:
+        resp = youtube.search().list(
+            q=query, part="id,snippet", maxResults=max_results,
+            type="video", order="relevance", relevanceLanguage=relevance_language,
+        ).execute()
+    except Exception as e:
+        print(f"  ⚠️  Search error '{query}': {e}")
+        return []
+    return [
+        {"video_id": item["id"]["videoId"], "title": item["snippet"]["title"],
+         "channel": item["snippet"]["channelTitle"],
+         "published_at": item["snippet"]["publishedAt"], "query": query}
+        for item in resp.get("items", []) if item["id"].get("videoId")
     ]
 
 
@@ -323,36 +380,50 @@ def get_comments(youtube, video_id: str, max_comments: int = 300) -> list:
     return comments
 
 
-def crawl(queries: list, label: str) -> list:
-    """Crawl semua query; kembalikan list komentar unik."""
+def crawl(channel_queries: list, label: str) -> list:
+    """
+    Opsi B: Crawl dari kanal Indonesia spesifik.
+    channel_queries = QUERIES_PER_CHANNEL_SERANGAN atau QUERIES_PER_CHANNEL_EKONOMI
+    Setiap query dijalankan di setiap kanal dalam INDONESIAN_CHANNELS.
+    """
     youtube = get_youtube_client()
     if not youtube:
         return []
 
     all_comments, seen_vids, seen_ids = [], set(), set()
-    print(f"\n🔍  [{label}] Mulai crawl {len(queries)} query…\n")
+    print(f"\n🔍  [{label}] Crawl {len(INDONESIAN_CHANNELS)} kanal × {len(channel_queries)} query…\n")
 
-    for query in queries:
-        print(f"  📌  [ID] {query}")
-        videos = search_videos(youtube, query, MAX_VIDEOS_PER_QUERY, "id")
-        print(f"       {len(videos)} video ditemukan")
+    for ch_name, ch_id in INDONESIAN_CHANNELS.items():
+        print(f"  📺  {ch_name}")
+        ch_videos = []
 
-        for v in videos:
-            if v["video_id"] in seen_vids:
-                continue
-            seen_vids.add(v["video_id"])
-            print(f"       🎬  {v['title'][:65]}…")
+        for query in channel_queries:
+            videos = search_videos_in_channel(
+                youtube, ch_id, ch_name, query, MAX_VIDEOS_PER_CHANNEL_QUERY
+            )
+            for v in videos:
+                if v["video_id"] not in seen_vids:
+                    seen_vids.add(v["video_id"])
+                    ch_videos.append(v)
+            time.sleep(0.3)
+
+        print(f"       {len(ch_videos)} video unik ditemukan")
+
+        for v in ch_videos:
+            print(f"       🎬  {v['title'][:65]}")
             comments = get_comments(youtube, v["video_id"], MAX_COMMENTS_PER_VIDEO)
             for c in comments:
                 if c["comment_id"] not in seen_ids:
                     seen_ids.add(c["comment_id"])
                     c["video_title"]  = v["title"]
-                    c["channel"]      = v["channel"]
-                    c["search_query"] = query
+                    c["channel"]      = ch_name
+                    c["channel_id"]   = ch_id
+                    c["search_query"] = v["query"]
                     c["query_lang"]   = "id"
                     all_comments.append(c)
             print(f"            → {len(comments)} komentar (total: {len(all_comments)})")
             time.sleep(0.5)
+
         time.sleep(1)
 
     print(f"\n✅  [{label}] {len(all_comments)} komentar unik terkumpul\n")
@@ -705,7 +776,7 @@ def main():
     print("\n" + "─"*65)
     print("  MODUL A: SERANGAN")
     print("─"*65)
-    raw_a = crawl(QUERIES_SERANGAN, "SERANGAN") if not demo_mode else make_demo_data_serangan(400)
+    raw_a = crawl(QUERIES_PER_CHANNEL_SERANGAN, "SERANGAN") if not demo_mode else make_demo_data_serangan(400)
 
     pd.DataFrame(raw_a).to_csv(RAW_OUTPUT_SERANGAN, index=False, encoding="utf-8")
     print(f"💾  Raw → {RAW_OUTPUT_SERANGAN}")
@@ -725,7 +796,7 @@ def main():
     print("\n" + "─"*65)
     print("  MODUL B: EKONOMI / SELAT HORMUZ")
     print("─"*65)
-    raw_b = crawl(QUERIES_EKONOMI, "EKONOMI") if not demo_mode else make_demo_data_ekonomi(400)
+    raw_b = crawl(QUERIES_PER_CHANNEL_EKONOMI, "EKONOMI") if not demo_mode else make_demo_data_ekonomi(400)
 
     pd.DataFrame(raw_b).to_csv(RAW_OUTPUT_EKONOMI, index=False, encoding="utf-8")
     print(f"💾  Raw → {RAW_OUTPUT_EKONOMI}")
