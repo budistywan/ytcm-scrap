@@ -35,36 +35,35 @@ from collections import defaultdict
 API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 
 # ── MODUL A: SERANGAN (Feb 28, 2026 — Khamenei tewas) ─────────────────────────
-# Campurkan query bahasa Indonesia + Inggris agar dapat video yang dikomentari orang Indonesia
+# Semua query BAHASA INDONESIA — target: komentar publik Indonesia
+# relevanceLanguage="id" dipaksa untuk semua query
 QUERIES_SERANGAN = [
-    # Bahasa Indonesia — komunitas Indonesia lebih banyak komentar di sini
     "serangan israel iran 2026",
     "israel serang iran khamenei mati 2026",
     "iran diserang israel amerika 2026",
     "khamenei meninggal serangan israel",
-    "iran israel perang 2026 indonesia",
     "reaksi indonesia serangan iran israel",
-    # Bahasa Inggris — video internasional yang juga dikomentari Indonesia
-    "Israel USA attack Iran February 2026",
-    "Khamenei killed Israel strike 2026",
-    "Iran supreme leader dead Israel attack",
-    "Iran Israel war 2026 Khamenei death",
+    "pendapat orang indonesia soal perang iran israel",
+    "iran israel perang maret 2026",
+    "khamenei tewas israel serang iran",
+    "indonesia tanggapi serangan iran israel",
+    "perang timur tengah iran israel 2026",
 ]
 
 # ── MODUL B: EKONOMI (Mar 10, 2026 — Penutupan Selat Hormuz) ──────────────────
+# Semua query BAHASA INDONESIA — target: komentar publik Indonesia
+# relevanceLanguage="id" dipaksa untuk semua query
 QUERIES_EKONOMI = [
-    # Bahasa Indonesia
     "iran tutup selat hormuz harga minyak",
     "selat hormuz ditutup iran dampak indonesia",
     "harga minyak naik iran israel 2026",
     "dampak perang iran minyak indonesia",
     "krisis minyak selat hormuz 2026",
-    # Bahasa Inggris
-    "Iran closes Strait of Hormuz oil price 2026",
-    "Hormuz strait blocked oil crisis March 2026",
-    "Iran Hormuz oil supply disruption 2026",
-    "oil price spike Iran war 2026",
-    "Iran blockade Hormuz economic impact",
+    "bbm naik gara gara iran hormuz",
+    "pertamina minyak iran selat hormuz",
+    "dampak ekonomi indonesia perang iran",
+    "harga bensin naik perang timur tengah",
+    "indonesia impor minyak iran hormuz ditutup",
 ]
 
 # ─── AKTOR & ENTITAS yang dideteksi ───────────────────────────────────────────
@@ -334,9 +333,8 @@ def crawl(queries: list, label: str) -> list:
     print(f"\n🔍  [{label}] Mulai crawl {len(queries)} query…\n")
 
     for query in queries:
-        lang = "id" if any(w in query for w in ["serangan","tutup","selat","harga","dampak","perang","minyak"]) else "en"
-        print(f"  📌  [{lang.upper()}] {query}")
-        videos = search_videos(youtube, query, MAX_VIDEOS_PER_QUERY, lang)
+        print(f"  📌  [ID] {query}")
+        videos = search_videos(youtube, query, MAX_VIDEOS_PER_QUERY, "id")
         print(f"       {len(videos)} video ditemukan")
 
         for v in videos:
@@ -351,7 +349,7 @@ def crawl(queries: list, label: str) -> list:
                     c["video_title"]  = v["title"]
                     c["channel"]      = v["channel"]
                     c["search_query"] = query
-                    c["query_lang"]   = lang
+                    c["query_lang"]   = "id"
                     all_comments.append(c)
             print(f"            → {len(comments)} komentar (total: {len(all_comments)})")
             time.sleep(0.5)
