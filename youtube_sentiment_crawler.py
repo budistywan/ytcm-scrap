@@ -45,15 +45,12 @@ API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 #                 + ~270 video × 2 halaman × 1 unit = ~540 unit comments
 #                 Total: ~5.340 unit (aman di bawah 10.000/hari)
 # Channel ID diverifikasi dari youtube.com/@handle → About → Share → Copy channel ID
+# Channel ID diverifikasi manual dari halaman YouTube masing-masing
 INDONESIAN_CHANNELS = {
-    "Kompas TV":     "UCTat5Lfqv8CvvzXMTQTcMpQ",  # @KompasTV
-    "CNN Indonesia": "UCuATgZgGbHkRRCOlP2HFsEg",  # @CNNIndonesia
-    "tvOne":         "UCkRTiF_tEz6RqDiHBGBdKzQ",  # @tvOneNews
-    "Metro TV":      "UCls31GKZS6VWZMH2BqsMTiw",  # @Metro_TV
-    "detikcom":      "UCHFBZxMhfMVBvjFV8R4Zomg",  # @detikcom
-    "Narasi":        "UCp9XuBFb_7bEFlCeVA0DKUQ",  # @narasi
-    "Tempo.co":      "UCQI4bu7-kDHtBhXlMJJleVA",  # @tempodotco
-    "Liputan6":      "UCVNaosgIaBWd5rAv5cNYl0w",  # @liputan6
+    "Kompas TV":     "UCneA4BuveCEgJql1m7lwFag",  # @kompastv       ✓ verified
+    "Metro TV":      "UCzl0OrB3-ehunyotIQvK77A",  # @metrotvnews    ✓ verified
+    "CNN Indonesia": "UCIohHXwCEKxWCLvAguJ-GjA",  # @cnnidofficial  ✓ verified
+    "iNews":         "UC_7n5QZdUIpPc0-C_s9hshg",   # @officialinews  ✓ verified
 }
 
 # 3 query per kanal — cukup untuk menangkap video relevan tanpa buang quota
