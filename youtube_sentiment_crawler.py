@@ -44,15 +44,16 @@ API_KEY = os.getenv("YOUTUBE_API_KEY", "")
 # Quota estimasi: 8 kanal × 3 query × 2 modul × 100 unit = 4.800 unit search
 #                 + ~270 video × 2 halaman × 1 unit = ~540 unit comments
 #                 Total: ~5.340 unit (aman di bawah 10.000/hari)
+# Channel ID diverifikasi dari youtube.com/@handle → About → Share → Copy channel ID
 INDONESIAN_CHANNELS = {
-    "Kompas TV":     "UCeGTFQJXSs7gFJSvM9K1rog",
-    "CNN Indonesia": "UCtbK_R7c_TrGTXQjMoAoaOg",
-    "tvOne":         "UC2T-HxGr5dMpEOz7YPRJm3w",
-    "Metro TV":      "UCuGnJLeMVFDWBOFtNKPk7zQ",
-    "detikcom":      "UCnewsRcNvNlDoAjqLGh4Epg",
-    "Narasi":        "UCpjX3QCOx4UZQ0BIkmrfG_g",
-    "Tempo.co":      "UCkFH-y5t5p9w5m9UFADhXUQ",
-    "Liputan6":      "UCjRdt28_GCZ9EXjFJqDN3gg",
+    "Kompas TV":     "UCTat5Lfqv8CvvzXMTQTcMpQ",  # @KompasTV
+    "CNN Indonesia": "UCuATgZgGbHkRRCOlP2HFsEg",  # @CNNIndonesia
+    "tvOne":         "UCkRTiF_tEz6RqDiHBGBdKzQ",  # @tvOneNews
+    "Metro TV":      "UCls31GKZS6VWZMH2BqsMTiw",  # @Metro_TV
+    "detikcom":      "UCHFBZxMhfMVBvjFV8R4Zomg",  # @detikcom
+    "Narasi":        "UCp9XuBFb_7bEFlCeVA0DKUQ",  # @narasi
+    "Tempo.co":      "UCQI4bu7-kDHtBhXlMJJleVA",  # @tempodotco
+    "Liputan6":      "UCVNaosgIaBWd5rAv5cNYl0w",  # @liputan6
 }
 
 # 3 query per kanal — cukup untuk menangkap video relevan tanpa buang quota
@@ -597,10 +598,26 @@ def analyze(comments: list, entity_dict: dict, label: str) -> tuple:
 
 def build_report(results, entity_stats, comment_types, id_comment_types,
                  module_label, module_desc, queries_used):
+    if not results:
+        return {
+            "module": module_label, "description": module_desc,
+            "generated_at": datetime.now().isoformat(),
+            "queries_used": queries_used,
+            "total_comments": 0, "indonesian_comments": 0,
+            "english_comments": 0,
+            "overall_sentiment": {"positive":0,"negative":0,"neutral":0},
+            "indonesian_sentiment": {"positive":0,"negative":0,"neutral":0},
+            "comment_type_distribution": {},
+            "indonesian_comment_type_distribution": {},
+            "entities": {}, "language_distribution": {},
+            "top_comments": {}, "top_indonesian_comments": {},
+            "error": "No comments collected — check channel IDs and queries.",
+        }
+
     df = pd.DataFrame(results)
 
-    id_df = df[df["is_indonesian"] == True]
-    en_df = df[df["language"] == "en"]
+    id_df = df[df["is_indonesian"] == True] if "is_indonesian" in df.columns else pd.DataFrame()
+    en_df = df[df["language"] == "en"] if "language" in df.columns else pd.DataFrame()
 
     def calc_actor(stats):
         out = {}
@@ -649,6 +666,8 @@ def build_report(results, entity_stats, comment_types, id_comment_types,
 
 def _top_comments(df):
     """Top 3 positif & negatif per entitas."""
+    if df is None or len(df) == 0:
+        return {}
     out = {}
     ent_cols = [c for c in df.columns if c.startswith("ent_")]
     for col in ent_cols:
@@ -656,11 +675,10 @@ def _top_comments(df):
         adf = df[df[col]==True]
         if len(adf) == 0:
             continue
+        cols = [c for c in ["text","ensemble_score","like_count","language","comment_type"] if c in adf.columns]
         out[ent_name] = {
-            "most_positive": adf.nlargest(3,"ensemble_score")[
-                ["text","ensemble_score","like_count","language","comment_type"]].to_dict("records"),
-            "most_negative": adf.nsmallest(3,"ensemble_score")[
-                ["text","ensemble_score","like_count","language","comment_type"]].to_dict("records"),
+            "most_positive": adf.nlargest(3,"ensemble_score")[cols].to_dict("records"),
+            "most_negative": adf.nsmallest(3,"ensemble_score")[cols].to_dict("records"),
         }
     return out
 
@@ -827,9 +845,12 @@ def main():
         id_n  = report["indonesian_comments"]
         print(f"\n  [{label}]")
         print(f"  Total komentar : {total}")
+        if total == 0:
+            print(f"  ⚠️  Tidak ada komentar — periksa channel ID di INDONESIAN_CHANNELS")
+            continue
         print(f"  Komentar ID    : {id_n} ({round(id_n/max(total,1)*100,1)}%)")
         print(f"  Tipe komentar Indonesia:")
-        for k,v in report["indonesian_comment_type_distribution"].items():
+        for k,v in report.get("indonesian_comment_type_distribution",{}).items():
             print(f"    {k:25s}: {v}")
 
     print(f"\n✅  Selesai! Load {COMBINED_RESULTS} ke dashboard.\n")
