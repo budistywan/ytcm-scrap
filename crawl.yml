@@ -1,0 +1,48 @@
+name: YouTube Sentiment Crawler
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_videos:
+        description: 'Max videos per query (default: 5)'
+        required: false
+        default: '5'
+      max_comments:
+        description: 'Max comments per video (default: 200)'
+        required: false
+        default: '200'
+
+jobs:
+  crawl-and-analyze:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          python -c "import nltk; nltk.download('punkt'); nltk.download('averaged_perceptron_tagger')"
+
+      - name: Run crawler & NLP
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          python youtube_sentiment_crawler.py
+
+      - name: Upload results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sentiment-results-${{ github.run_number }}
+          path: |
+            sentiment_results.json
+            analyzed_comments.csv
+            iran_conflict_comments_raw.csv
+          retention-days: 30
