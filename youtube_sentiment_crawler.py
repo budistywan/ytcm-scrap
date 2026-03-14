@@ -1,858 +1,883 @@
 """
-YouTube Comment Sentiment Analyzer — v2
-=========================================
-Studi kasus: Serangan Israel-USA ke Iran (Feb-Mar 2026)
-Target audiens: Komentar Indonesia di YouTube
+youtube_discourse_analyzer.py
+==============================
+Frame-Aware Indonesian Discourse Analyzer
+Versi 3.0 — rewrite substantif per brief revisi
 
-DUA MODUL ANALISIS:
-  A) SERANGAN — Sentimen publik Indonesia terhadap pelaku & aktor
-     Fokus: USA, Israel, Iran, Khamenei, Syiah, China, Rusia
-     Tujuan: Apakah komentar Indonesia bisa 'jernih' melihat (hubungan diplomatik,
-             sesama Islam), atau masih terbawa dikotomi Khamenei/Syiah?
-             (konteks: Indonesia mayoritas Muslim Sunni, non-Syiah)
+Tujuan riset:
+  Membedakan frame diskursus komentar publik Indonesia terhadap dua peristiwa:
+  - Modul A: Serangan Israel–AS ke Iran & kematian Khamenei (window: 2026-02-28 s/d 2026-03-05)
+  - Modul B: Penutupan Selat Hormuz & dampak ekonomi (window: 2026-03-10 s/d 2026-03-16)
 
-  B) EKONOMI — Penutupan Selat Hormuz & dampak minyak (sekitar 10 Mar 2026)
-     Fokus: USA, Israel, Iran, China, Rusia, harga minyak
-     Tujuan: Apakah diskusi ekonomi lebih substantif atau sekadar penonton konflik?
+Output utama: discourse frame classification (multi-label), bukan sentiment.
+Sentiment (VADER/TextBlob) hanya metadata tambahan, bukan hasil inti.
 
-Requirements
-------------
-    pip install google-api-python-client vaderSentiment textblob langdetect pandas tqdm
+PERUBAHAN DARI VERSI SEBELUMNYA:
+  - Single-label hierarchical → multi-label frame classification
+  - Entity detection dipisah dari frame detection
+  - Substring matching → regex word-boundary + phrase matching
+  - Normalisasi teks sebelum matching (lowercase, URL strip, slang ringan)
+  - Query dipecah per frame (bukan hanya topik umum)
+  - Event window filtering via publishedAfter/publishedBefore
+  - VADER/TextBlob hanya sebagai metadata opsional
+  - Lexicon modular dan editable di CONFIG
+  - Modul audit/evaluasi manual
+  - Output lengkap: CSV per komentar + JSON agregat + ringkasan per label
 
-Usage
------
-    export YOUTUBE_API_KEY="AIza..."
-    python youtube_sentiment_crawler_v2.py
+KETERBATASAN YANG TERSISA (lihat juga WARNING di output):
+  - Rule-based = indikasi awal, bukan ground truth
+  - Label sektarian WAJIB diaudit manual sebelum klaim akademik
+  - VADER/TextBlob tidak dioptimalkan untuk Bahasa Indonesia informal
+  - Komentar YouTube tidak mewakili seluruh opini publik Indonesia
 """
 
-import os, json, time, re
-import pandas as pd
-from datetime import datetime
+import os
+import re
+import csv
+import json
+import random
+import logging
+from datetime import datetime, timezone
 from collections import defaultdict
 
-# ─── CONFIGURATION ────────────────────────────────────────────────────────────
+import googleapiclient.discovery
+from langdetect import detect, LangDetectException
 
-API_KEY = os.getenv("YOUTUBE_API_KEY", "")
+# Opsional — hanya metadata tambahan
+try:
+    from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+    from textblob import TextBlob
+    SENTIMENT_AVAILABLE = True
+except ImportError:
+    SENTIMENT_AVAILABLE = False
 
-# ─── KANAL INDONESIA TARGET (Opsi B) ─────────────────────────────────────────
-# Channel ID didapat dari URL kanal YouTube masing-masing.
-# Format: youtube.com/channel/CHANNEL_ID atau youtube.com/@handle
-# Untuk verifikasi: buka kanal → About → Share → Copy channel ID
-#
-# TIER 1 — Kanal berita besar, audience luas, banyak komentar konflik luar negeri
-# 8 kanal dipilih berdasarkan: audience luas, aktif, banyak komentar berita luar negeri
-# Quota estimasi: 8 kanal × 3 query × 2 modul × 100 unit = 4.800 unit search
-#                 + ~270 video × 2 halaman × 1 unit = ~540 unit comments
-#                 Total: ~5.340 unit (aman di bawah 10.000/hari)
-# Channel ID diverifikasi dari youtube.com/@handle → About → Share → Copy channel ID
-# Channel ID diverifikasi manual dari halaman YouTube masing-masing
-INDONESIAN_CHANNELS = {
-    "Kompas TV":     "UCneA4BuveCEgJql1m7lwFag",  # @kompastv       ✓ verified
-    "Metro TV":      "UCzl0OrB3-ehunyotIQvK77A",  # @metrotvnews    ✓ verified
-    "CNN Indonesia": "UCIohHXwCEKxWCLvAguJ-GjA",  # @cnnidofficial  ✓ verified
-    "iNews":         "UC_7n5QZdUIpPc0-C_s9hshg",   # @officialinews  ✓ verified
+# ══════════════════════════════════════════════════════════════════════════════
+# KONFIGURASI UTAMA — semua parameter riset di sini, mudah diubah
+# ══════════════════════════════════════════════════════════════════════════════
+
+CONFIG = {
+
+    # ── API ──────────────────────────────────────────────────────────────────
+    "api_key": os.environ.get("YOUTUBE_API_KEY", ""),
+    "max_results_per_query": 5,      # video per query
+    "max_comments_per_video": 100,   # komentar per video
+
+    # ── KANAL INDONESIA TERVERIFIKASI ─────────────────────────────────────────
+    # Format: {"nama_tampilan": "channel_id"}
+    # Channel ID diverifikasi manual dari halaman YouTube masing-masing kanal.
+    "channels": {
+        "Metro TV":      "UCzl0OrB3-ehunyotIQvK77A",   # @metrotvnews ✓
+        "iNews":         "UC_7n5QZdUIpPc0-C_s9hshg",   # @officialinews ✓
+        "Kompas TV":     "UCneA4BuveCEgJql1m7lwFag",   # @kompastv ✓
+        "CNN Indonesia": "UCIohHXwCEKxWCLvAguJ-GjA",   # @cnnidofficial — perlu verifikasi ulang
+        # Tambahkan kanal baru di sini:
+        # "tvOne":       "CHANNEL_ID_TVOONE",
+        # "Narasi":      "CHANNEL_ID_NARASI",
+        # "Liputan6":    "CHANNEL_ID_LIPUTAN6",
+    },
+
+    # ── EVENT WINDOWS ────────────────────────────────────────────────────────
+    # Format: ISO 8601 (UTC). YouTube API gunakan publishedAfter/publishedBefore.
+    "modules": {
+        "A": {
+            "name": "Serangan Israel–AS ke Iran & Kematian Khamenei",
+            "window_start": "2026-02-28T00:00:00Z",
+            "window_end":   "2026-03-05T23:59:59Z",
+        },
+        "B": {
+            "name": "Penutupan Selat Hormuz & Dampak Ekonomi",
+            "window_start": "2026-03-10T00:00:00Z",
+            "window_end":   "2026-03-16T23:59:59Z",
+        },
+    },
+
+    # ── QUERY PER FRAME (dipecah berdasarkan frame, bukan hanya topik umum) ──
+    # Setiap modul punya query set per frame. Mudah ditambah tanpa ubah logika.
+    "queries": {
+        "A": {
+            "geopolitik": [
+                "serangan AS Israel ke Iran",
+                "Iran diserang Amerika Israel",
+                "agresi Israel ke Iran",
+                "pembunuhan Khamenei",
+                "reaksi dunia serangan Iran",
+                "konflik Iran Israel 2026",
+            ],
+            "sektarian": [
+                "Khamenei Syiah",
+                "Iran Syiah",
+                "Syiah vs Sunni Iran",
+                "sesama muslim bela Iran",
+                "jangan bela Syiah",
+                "Iran saudara muslim",
+                "Syiah bukan Islam",
+                "Sunni dukung Iran",
+            ],
+        },
+        "B": {
+            "ekonomi": [
+                "Selat Hormuz Indonesia",
+                "BBM naik Iran",
+                "perang Iran harga minyak Indonesia",
+                "Pertamina Hormuz",
+                "impor minyak Indonesia Timur Tengah",
+                "harga Pertalite Iran",
+                "sembako naik karena minyak",
+                "cadangan minyak Indonesia",
+            ],
+            "geopolitik": [
+                "Hormuz ditutup Iran",
+                "Iran tutup selat Hormuz",
+                "dampak Hormuz global",
+            ],
+        },
+    },
+
+    # ── AUDIT ────────────────────────────────────────────────────────────────
+    "audit_sample_size": 150,   # komentar per modul untuk audit manual
+
+    # ── OUTPUT ───────────────────────────────────────────────────────────────
+    "output_dir": "output",
 }
 
-# 3 query per kanal — cukup untuk menangkap video relevan tanpa buang quota
-QUERIES_PER_CHANNEL_SERANGAN = [
-    "iran israel serangan",
-    "khamenei",
-    "perang iran israel 2026",
-]
+# ══════════════════════════════════════════════════════════════════════════════
+# LEXICON — modular dan editable. Pisahkan per frame.
+# Setiap entry bisa berupa: string (phrase) atau dict {pattern, note}
+#
+# CATATAN DESAIN:
+#   - Semua matching pakai regex word-boundary (\b) atau phrase, BUKAN substring sederhana.
+#   - Token pendek berisiko (<= 3 karakter seperti "un") tidak dipakai sebagai keyword tunggal.
+#   - Setiap frame mempunyai lexicon sendiri untuk kemudahan audit dan modifikasi.
+# ══════════════════════════════════════════════════════════════════════════════
 
-QUERIES_PER_CHANNEL_EKONOMI = [
-    "selat hormuz minyak",
-    "harga minyak naik iran",
-    "dampak ekonomi iran indonesia",
-]
+LEXICON = {
 
-MAX_VIDEOS_PER_CHANNEL_QUERY = 3   # 3 video per query per kanal
-MAX_COMMENTS_PER_VIDEO       = 200  # komentar per video
+    # ── ENTITY LEXICON ────────────────────────────────────────────────────────
+    # Dipisah dari frame. Mendeteksi penyebutan entitas, bukan frame-nya.
+    "entities": {
+        "USA":       [r"\bamerika\b", r"\bamerican?\b", r"\bas\b(?!\w)", r"\busa\b", r"\bwashington\b", r"\bbiden\b", r"\btrump\b"],
+        "Israel":    [r"\bisrael\b", r"\bzionis\b", r"\bnetanyahu\b", r"\btel.?aviv\b", r"\bidf\b"],
+        "Iran":      [r"\biran\b", r"\bteheran\b", r"\btehran\b", r"\bpersia\b"],
+        "Khamenei":  [r"\bkhamenei\b", r"\bkhomeini\b", r"\bkhamene[i']?\b", r"\bali khamenei\b", r"\bmojtaba\b"],
+        "Syiah":     [r"\bsyi[i']?ah\b", r"\bshia\b", r"\bsyi[ae]\b"],
+        "Sunni":     [r"\bsunni\b", r"\bahlus sunnah\b", r"\bahlussunnah\b"],
+        "China":     [r"\bcina\b", r"\bchina\b", r"\btiongkok\b", r"\bbeijing\b", r"\bxi jinping\b"],
+        "Rusia":     [r"\brusia\b", r"\brussia\b", r"\bmoskow?\b", r"\bputin\b"],
+        "Hormuz":    [r"\bhormuz\b", r"\bselat hormuz\b", r"\bhormuz strait\b"],
+        "Pertamina": [r"\bpertamina\b"],
+        "BBM":       [r"\bbbm\b", r"\bpertalite\b", r"\bpertamax\b", r"\bsolar\b(?!\s+system)", r"\bbensol\b"],
+        "Minyak":    [r"\bminyak\b", r"\boil\b", r"\bcrude\b", r"\bpetroleum\b", r"\bkilang\b"],
+    },
 
-# ── MODUL A: SERANGAN (Feb 28, 2026 — Khamenei tewas) ─────────────────────────
-# Semua query BAHASA INDONESIA — target: komentar publik Indonesia
-# relevanceLanguage="id" dipaksa untuk semua query
-QUERIES_SERANGAN = [
-    "serangan israel iran 2026",
-    "israel serang iran khamenei mati 2026",
-    "iran diserang israel amerika 2026",
-    "khamenei meninggal serangan israel",
-    "reaksi indonesia serangan iran israel",
-    "pendapat orang indonesia soal perang iran israel",
-    "iran israel perang maret 2026",
-    "khamenei tewas israel serang iran",
-    "indonesia tanggapi serangan iran israel",
-    "perang timur tengah iran israel 2026",
-]
+    # ── FRAME LEXICONS ────────────────────────────────────────────────────────
 
-# ── MODUL B: EKONOMI (Mar 10, 2026 — Penutupan Selat Hormuz) ──────────────────
-# Semua query BAHASA INDONESIA — target: komentar publik Indonesia
-# relevanceLanguage="id" dipaksa untuk semua query
-QUERIES_EKONOMI = [
-    "iran tutup selat hormuz harga minyak",
-    "selat hormuz ditutup iran dampak indonesia",
-    "harga minyak naik iran israel 2026",
-    "dampak perang iran minyak indonesia",
-    "krisis minyak selat hormuz 2026",
-    "bbm naik gara gara iran hormuz",
-    "pertamina minyak iran selat hormuz",
-    "dampak ekonomi indonesia perang iran",
-    "harga bensin naik perang timur tengah",
-    "indonesia impor minyak iran hormuz ditutup",
-]
+    "geo_diplomatik": {
+        # Framing geopolitik, kedaulatan, hukum internasional
+        "phrases": [
+            r"\bkedaulatan\b", r"\bhukum internasional\b", r"\bpbb\b", r"\bsanksi\b",
+            r"\bembargo\b", r"\bhubungan bilateral\b", r"\bdiplomasi\b", r"\bkonflik geopolitik\b",
+            r"\bketegangan kawasan\b", r"\bkeseimbangan kekuatan\b", r"\bproxy war\b",
+            r"\bperang proxy\b", r"\bgeopolitik\b", r"\bstabilitas kawasan\b",
+            r"\bkepentingan nasional\b", r"\bkawasan timur tengah\b", r"\bnato\b",
+            r"\bperjanjian\b", r"\bgencatan senjata\b", r"\bnorma internasional\b",
+            r"\bpelanggaran kedaulatan\b", r"\bagresi militer\b", r"\bserang duluan\b",
+            r"\bhak mempertahankan diri\b", r"\bself.?defense\b",
+        ],
+        "note": "Frame geopolitik/diplomatik — analisis berbasis kedaulatan dan hukum internasional",
+    },
 
-# ─── AKTOR & ENTITAS yang dideteksi ───────────────────────────────────────────
+    "kemanusiaan": {
+        # Framing kemanusiaan universal, korban sipil
+        "phrases": [
+            r"\bkorban sipil\b", r"\brakyat\b.*\b(menderita|sengsara)\b",
+            r"\b(menderita|sengsara)\b.*\brakyat\b",
+            r"\banak.?anak\b.*\b(tewas|meninggal|korban)\b",
+            r"\b(tewas|meninggal|korban)\b.*\banak.?anak\b",
+            r"\bwarga sipil\b", r"\brefugee\b", r"\bpengungsi\b",
+            r"\btragedi kemanusiaan\b", r"\bgenosida\b", r"\bhak asasi\b",
+            r"\bham\b(?!\w)", r"\bperang tidak manusiawi\b",
+            r"\bpenderitaan\b", r"\bselamatkan nyawa\b", r"\bjangan (ada )?korban\b",
+        ],
+        "note": "Framing kemanusiaan universal — tidak berbasis identitas agama/etnis",
+    },
 
-# Modul A: Aktor geopolitik + dimensi agama/sektarian
-ENTITIES_SERANGAN = {
-    # Pelaku serangan
-    "Israel": [
-        "israel", "idf", "zionis", "zionist", "tel aviv", "netanyahu",
-        "israelis", "pasukan israel",
-    ],
-    "USA": [
-        "usa", "america", "amerika", "united states", "washington",
-        "pentagon", "biden", "trump", "us military", "militer as",
-    ],
-    # Korban / pihak diserang
-    "Iran": [
-        "iran", "iranian", "persia", "teheran", "tehran", "irgc",
-        "republik islam", "islamic republic",
-    ],
-    "Khamenei": [
-        "khamenei", "ali khamenei", "supreme leader", "pemimpin tertinggi",
-        "ayatollah", "rahbar", "mursyid", "wali faqih",
-    ],
-    # Dimensi sektarian — INI KUNCI ANALISIS
-    "Syiah": [
-        "syiah", "shia", "syi'ah", "syiah iran", "shia islam",
-        "sunni syiah", "sunni shia", "sektarian", "hezbollah", "hizbullah",
-        "houthi", "houthi", "milisi syiah", "shia militia",
-    ],
-    # Pendukung Iran
-    "China": [
-        "china", "cina", "tiongkok", "beijing", "xi jinping",
-        "chinese", "prc", "rrc",
-    ],
-    "Rusia": [
-        "russia", "rusia", "russion", "moscow", "moskow", "putin",
-        "kremlin", "vladimir",
-    ],
+    "solidaritas_emosional": {
+        # Dukungan/penolakan berbasis emosi atau identitas keagamaan tanpa analisis
+        "phrases": [
+            r"\bdukung iran\b", r"\bbela iran\b", r"\ballahu akbar\b.*\biran\b",
+            r"\biran\b.*\ballahu akbar\b",
+            r"\bsemoga iran menang\b", r"\bhajar (terus|mereka)\b",
+            r"\bkafir (menyerang|vs)\b", r"\bmaju terus iran\b",
+            r"\bsemangat iran\b", r"\biran kuat\b", r"\biran tidak takut\b",
+            r"\bkita (semua )?dukung\b.*\biran\b",
+            r"\biran\b.*\b(semangat|terus|maju)\b",
+        ],
+        "note": "Dukungan emosional terhadap Iran — belum tentu sektarian, bisa patriotik atau simpati umum",
+    },
+
+    "sektarian_syiah_sunni": {
+        # Frame sektarian — label sensitif, WAJIB diaudit manual
+        "phrases": [
+            r"\bsyi[i']?ah\b.*\b(bukan islam|sesat|kafir)\b",
+            r"\b(bukan islam|sesat|kafir)\b.*\bsyi[i']?ah\b",
+            r"\bjangan bela syi[i']?ah\b",
+            r"\biran syi[i']?ah\b.*\bbukan (saudara|islam)\b",
+            r"\bsyi[i']?ah bukan (saudara|islam)\b",
+            r"\bsunni (vs|lawan) syi[i']?ah\b",
+            r"\bsyi[i']?ah (vs|lawan) sunni\b",
+            r"\brafidhah\b", r"\bmazhab (sesat|salah)\b",
+            r"\bahlul bait\b.*\b(sesat|salah)\b",
+            r"\bsyi[i']?ah\b.*\b(musuh|lawan)\b.*\bsunni\b",
+            r"\btidak perlu bela iran.*syi[i']?ah\b",
+            r"\bbela iran karena (islam|muslim)\b",
+        ],
+        "note": "⚠️ LABEL SENSITIF — wajib audit manual. Hanya positif jika frame sektarian eksplisit terbaca.",
+    },
+
+    "anti_barat": {
+        # Frame anti-Barat, anti-imperialisme, anti-Amerika
+        "phrases": [
+            r"\bimperialis\b", r"\bpenjajah\b", r"\bhegemoni (barat|as|amerika)\b",
+            r"\bwakil (iblis|setan)\b.*\b(as|israel|barat)\b",
+            r"\bkaki tangan barat\b", r"\bpion barat\b", r"\bbarat munafik\b",
+            r"\bamerika biadab\b", r"\binternasional bungkam\b",
+            r"\bdunia (diam|bungkam|tutup mata)\b",
+            r"\bpbb tidak berguna\b", r"\bpbb gagal\b",
+            r"\bdua standard\b", r"\bdouble standard\b",
+            r"\bnew world order\b", r"\bnwo\b(?!\w)",
+            r"\bbarat\b.*\b(jahat|laknat|biadab)\b",
+        ],
+        "note": "Frame anti-Barat/anti-imperialisme — bisa tumpang tindih dengan geo_diplomatik",
+    },
+
+    "ekonomi_global": {
+        # Dampak ekonomi global, harga minyak dunia
+        "phrases": [
+            r"\bharga minyak (dunia|global|internasional)\b",
+            r"\bpasar (minyak|energi|komoditas)\b",
+            r"\bopec\b", r"\bsupply chain\b", r"\brantai pasok\b",
+            r"\bgangguan (pasokan|distribusi|supply)\b",
+            r"\bselat hormuz\b.*\bjalur\b",
+            r"\bpengiriman minyak\b", r"\btanker\b", r"\bblokade\b",
+            r"\bkrisis energi (global|dunia)\b",
+        ],
+        "note": "Dampak ekonomi global — harga minyak dunia, rantai pasok",
+    },
+
+    "ekonomi_lokal_indonesia": {
+        # Dampak ke Indonesia secara spesifik
+        "phrases": [
+            r"\bbbm naik\b", r"\bpertalite (mahal|naik)\b", r"\bpertamax naik\b",
+            r"\bsolar naik\b", r"\bharga (bbm|bensin|solar|pertalite) naik\b",
+            r"\bharga barang naik\b", r"\bsembako naik\b", r"\brakyat susah\b",
+            r"\bpertamina (siap|bisa|mampu|bagaimana)\b",
+            r"\bimpor minyak\b.*\bindonesia\b", r"\bindonesia\b.*\bimpor minyak\b",
+            r"\bdolar naik\b", r"\bnilai tukar\b.*\bnegeri\b",
+            r"\befek ke indonesia\b", r"\bdampak ke (indonesia|kita|rakyat)\b",
+            r"\bindonesia (terdampak|kena dampak)\b",
+            r"\bujung.?ujung(nya)?\b.*\brakyat\b",
+            r"\bcadangan minyak\b.*\bindonesia\b",
+            r"\bindonesia\b.*\bcadangan minyak\b",
+            r"\benergy security\b.*\bindonesia\b",
+            r"\bketahanan energi\b",
+        ],
+        "note": "Dampak ekonomi lokal ke Indonesia — BBM, Pertamina, sembako, impor minyak",
+    },
+
+    "netral_informasional": {
+        # Komentar yang hanya menginformasikan ulang berita, tanpa stance
+        "phrases": [
+            r"^\s*(breaking|berita)\s*:\s*",
+            r"\bmenurut (laporan|berita|media)\b",
+            r"\bdilaporkan bahwa\b",
+            r"\bupdate\s*:\s*",
+            r"\binfo\s*:\s*",
+            r"\bfyi\s*:?\b",
+        ],
+        "note": "Komentar informatif/update berita tanpa frame diskursif yang jelas",
+    },
+
+    "noise_spam": {
+        # Komentar spam, promosi, tidak relevan
+        "phrases": [
+            r"\bsubscribe\b", r"\bfollow\b.*\bchannel\b",
+            r"\bjual\b.*\bmurah\b", r"\bharga\b.*\bpromo\b",
+            r"(wa|whatsapp|telegram|ig)\s*:?\s*\+?\d{8,}",
+            r"\bslot\b.*\bonline\b", r"\bjudi (online|slot)\b",
+            r"\bagen\b.*\bresmi\b",
+        ],
+        "note": "Spam, promosi, konten tidak relevan — dikecualikan dari analisis",
+    },
 }
 
-# Modul B: Entitas ekonomi + geopolitik
-ENTITIES_EKONOMI = {
-    "USA": [
-        "usa", "america", "amerika", "united states", "washington",
-        "us sanctions", "sanksi as", "trump", "biden",
-    ],
-    "Israel": [
-        "israel", "idf", "zionis", "zionist", "netanyahu", "tel aviv",
-    ],
-    "Iran": [
-        "iran", "iranian", "persia", "teheran", "irgc", "republik islam",
-        "hormuz", "selat hormuz", "strait of hormuz",
-    ],
-    "China": [
-        "china", "cina", "tiongkok", "beijing", "xi jinping",
-        "chinese oil", "minyak china", "pembeli minyak iran",
-    ],
-    "Rusia": [
-        "russia", "rusia", "moscow", "putin", "kremlin",
-        "russian oil", "minyak rusia", "opec",
-    ],
-    # Dimensi ekonomi — KUNCI ANALISIS MODUL B
-    "Minyak_Energi": [
-        "minyak", "oil", "bbm", "bensin", "solar", "pertamina",
-        "harga minyak", "oil price", "crude oil", "brent",
-        "energi", "energy", "bahan bakar", "fuel",
-        "opec", "cadangan minyak", "oil reserve",
-    ],
-    "Dampak_Indonesia": [
-        "indonesia", "rupiah", "ihsg", "inflasi", "inflation",
-        "subsidi", "subsidy", "anggaran", "budget", "apbn",
-        "daya beli", "purchasing power", "ekonomi indonesia",
-        "impor minyak", "import minyak",
-    ],
+# ══════════════════════════════════════════════════════════════════════════════
+# PREPROCESSING
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Kamus normalisasi slang ringan — tambahkan sesuai kebutuhan
+SLANG_DICT = {
+    r"\bgak\b":     "tidak",
+    r"\bnggak\b":   "tidak",
+    r"\bnga\b":     "tidak",
+    r"\bgakk\b":    "tidak",
+    r"\bga\b(?!\w)":"tidak",
+    r"\byg\b":      "yang",
+    r"\bkrn\b":     "karena",
+    r"\bkrna\b":    "karena",
+    r"\bgara2\b":   "gara-gara",
+    r"\bkita2\b":   "kita",
+    r"\bbaik2\b":   "baik-baik",
+    r"\bbnyk\b":    "banyak",
+    r"\bdgn\b":     "dengan",
+    r"\bdri\b":     "dari",
+    r"\bprtama\b":  "pertama",
+    r"\bsdh\b":     "sudah",
+    r"\bblm\b":     "belum",
+    r"\bjg\b":      "juga",
+    r"\bspt\b":     "seperti",
 }
 
-# ─── KAMUS TONE khusus Indonesia ──────────────────────────────────────────────
-#
-# KERANGKA ANALISIS MODUL A — 3 KUTUB JERNIH vs DIKOTOMI:
-#
-#   JERNIH (1): Perspektif diplomatik — melihat Iran sebagai negara berdaulat,
-#               terlepas dari sekte. Bicara hubungan bilateral, hukum internasional.
-#
-#   JERNIH (2): Perspektif sesama Islam — solidaritas kemanusiaan yang TIDAK
-#               membedakan Syiah/Sunni, bicara penderitaan warga sipil.
-#
-#   DIKOTOMI: Respons terbawa frame Syiah vs Sunni — Iran = Syiah = bukan saudara
-#             sepenuhnya, atau sebaliknya membela Iran KARENA sesama Muslim tanpa
-#             melihat konteks diplomatik/hukum.
-#
-TONE_PATTERNS = {
+def preprocess(text: str) -> str:
+    """
+    Normalisasi teks sebelum matching.
+    Urutan: lowercase → strip URL → strip mention → strip simbol berlebih
+            → normalisasi spasi → normalisasi slang ringan
+    """
+    if not text:
+        return ""
+    t = text.lower()
+    # Hapus URL
+    t = re.sub(r"https?://\S+|www\.\S+", " ", t)
+    # Hapus mention @user
+    t = re.sub(r"@\w+", " ", t)
+    # Hapus tanda baca yang tidak bermakna (pertahankan tanda hubung dan apostrof dalam kata)
+    t = re.sub(r"[^\w\s\-']", " ", t)
+    # Normalisasi spasi
+    t = re.sub(r"\s+", " ", t).strip()
+    # Normalisasi slang
+    for pattern, replacement in SLANG_DICT.items():
+        t = re.sub(pattern, replacement, t)
+    return t
 
-    # ── TANDA JERNIH ─────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTITY DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # Jernih-1: Perspektif diplomatik / hubungan antarnegara
-    "jernih_diplomatik": [
-        "hubungan diplomatik", "kedaulatan", "sovereignty", "hukum internasional",
-        "international law", "pembunuhan pemimpin negara", "state assassination",
-        "pelanggaran hukum", "violation", "pbb", "un", "dewan keamanan",
-        "kepentingan nasional", "national interest", "hubungan bilateral",
-        "kebijakan luar negeri", "foreign policy", "non blok", "non-aligned",
-        "geopolitik", "geopolitics", "konsekuensi diplomatik",
-        "pengakuan kedaulatan", "invasi", "agresi",
-    ],
+def detect_entities(cleaned_text: str) -> list[str]:
+    """
+    Deteksi entitas dengan regex word-boundary.
+    Mengembalikan list entitas yang terdeteksi (bisa lebih dari satu).
+    """
+    detected = []
+    for entity_name, patterns in LEXICON["entities"].items():
+        for pattern in patterns:
+            if re.search(pattern, cleaned_text, re.IGNORECASE):
+                detected.append(entity_name)
+                break  # cukup satu pattern match per entitas
+    return detected
 
-    # Jernih-2: Perspektif sesama Muslim tanpa frame sektarian
-    # (solidaritas kemanusiaan, tidak mempermasalahkan Syiah-nya)
-    "jernih_kemanusiaan": [
-        "warga sipil", "civilian", "korban sipil", "korban tak berdosa",
-        "anak-anak", "perempuan", "kemanusiaan", "humanitarian",
-        "hak asasi", "ham", "human rights", "penderitaan",
-        "sesama manusia", "sesama muslim", "saudara seiman",
-        "tanpa memandang", "tak peduli syiah atau sunni",
-        "bukan soal syiah", "bukan urusan sekte",
-        "muslim manapun", "semua muslim",
-    ],
+# ══════════════════════════════════════════════════════════════════════════════
+# FRAME DETECTION (multi-label)
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # ── TANDA DIKOTOMI SEKTARIAN ─────────────────────────────────────────────
+FRAME_LABELS = [
+    "geo_diplomatik",
+    "kemanusiaan",
+    "solidaritas_emosional",
+    "sektarian_syiah_sunni",
+    "anti_barat",
+    "ekonomi_global",
+    "ekonomi_lokal_indonesia",
+    "netral_informasional",
+    "noise_spam",
+]
 
-    # Dikotomi aktif: mempermasalahkan ke-Syiah-an Iran secara eksplisit
-    "dikotomi_syiah": [
-        "syiah sesat", "syiah kafir", "syiah bukan islam", "syiah bukan muslim",
-        "mereka syiah", "iran syiah", "khamenei syiah", "bela syiah",
-        "ngapain bela syiah", "syiah dapat karma", "syiah memang begitu",
-        "tidak perlu bela syiah", "syiah vs sunni", "sunni jangan bela syiah",
-        "syiah musuh sunni", "mereka bukan saudara kita",
-        "bukan saudara seiman", "beda akidah",
-    ],
+def detect_frames(cleaned_text: str, original_text: str) -> dict:
+    """
+    Multi-label frame detection.
+    Setiap komentar bisa memiliki lebih dari satu label.
+    Mengembalikan dict:
+      {
+        "frames": ["geo_diplomatik", "ekonomi_lokal_indonesia"],
+        "match_details": {"geo_diplomatik": ["pola yang match"], ...}
+      }
 
-    # Dikotomi pasif: membela Iran KARENA label Islam/Muslim, tanpa analisis
-    # (solidaritas sektarian terselubung — Iran = Muslim = harus dibela)
-    "solidaritas_buta": [
-        "bela iran karena muslim", "iran saudara muslim", "sesama muslim harus bela",
-        "karena iran islam", "iran negara islam", "republik islam harus kita dukung",
-        "allahu akbar iran", "takbir untuk iran", "doa untuk iran menang",
-        "iran pasti menang karena allah", "iran dilindungi allah",
-        "iran pejuang islam", "iran benteng islam",
-        "hidup iran", "viva iran", "iran kuat", "semangat iran",
-    ],
+    DESAIN:
+    - Matching pakai regex dari LEXICON, bukan substring sederhana.
+    - Tidak ada hierarki — semua frame yang match dilaporkan.
+    - noise_spam diperiksa pertama; jika positif, frame lain diabaikan.
+    """
+    frames = []
+    match_details = {}
 
-    # ── TANDA LAIN ───────────────────────────────────────────────────────────
+    # 1. Cek noise_spam terlebih dahulu
+    noise_matches = _match_phrases(cleaned_text, LEXICON["noise_spam"]["phrases"])
+    if noise_matches:
+        return {"frames": ["noise_spam"], "match_details": {"noise_spam": noise_matches}}
 
-    # Analitis — menggunakan data/fakta/sejarah (lintas Syiah-Sunni)
-    "analitis": [
-        "analisis", "sebenarnya", "faktanya", "data menunjukkan",
-        "secara historis", "sejarahnya", "track record", "menurut saya",
-        "perlu dipahami", "konteksnya adalah", "latar belakang",
-        "strategi", "skenario", "implikasi", "konsekuensi",
-        "jika dilihat dari", "dari sudut pandang",
-    ],
+    # 2. Deteksi semua frame lain
+    for frame in FRAME_LABELS:
+        if frame in ("noise_spam", "netral_informasional"):
+            continue
+        if frame not in LEXICON:
+            continue
+        matches = _match_phrases(cleaned_text, LEXICON[frame]["phrases"])
+        if matches:
+            frames.append(frame)
+            match_details[frame] = matches
 
-    # Reaktif emosional — kemarahan tanpa frame sektarian maupun analisis
-    "reaktif_emosional": [
-        "bangsat", "anjing", "laknat", "kutuk", "keparat", "biadab",
-        "pembunuh", "killer", "murderer", "genocide", "genosida",
-        "monster", "evil", "jahat", "brutal", "barbar",
-    ],
+    # 3. Cek netral_informasional terakhir (hanya jika tidak ada frame lain)
+    if not frames:
+        ni_matches = _match_phrases(original_text, LEXICON["netral_informasional"]["phrases"])
+        if ni_matches:
+            frames = ["netral_informasional"]
+            match_details["netral_informasional"] = ni_matches
 
-    # Nuansa ekonomi lokal (relevan juga di Modul A, lebih kuat di B)
-    "nuansa_ekonomi_lokal": [
-        "bbm naik", "bensin naik", "harga naik", "mahal", "susah",
-        "rakyat kecil", "masyarakat bawah", "kita yang rugi",
-        "indonesia rugi", "dampaknya ke kita", "dampak ke indonesia",
-    ],
-}
+    # 4. Jika benar-benar tidak ada frame — label sebagai "tidak_terklasifikasi"
+    if not frames:
+        frames = ["tidak_terklasifikasi"]
 
-MAX_COMMENTS_PER_VIDEO = 300   # Lebih banyak per video
-MAX_VIDEOS_PER_QUERY   = 5
-
-# Filter bahasa — PRIORITAS INDONESIA
-TARGET_LANGUAGES = ["id", "en"]  # id = Indonesia, en = English
-
-RAW_OUTPUT_SERANGAN   = "raw_serangan.csv"
-RAW_OUTPUT_EKONOMI    = "raw_ekonomi.csv"
-ANALYZED_SERANGAN     = "analyzed_serangan.csv"
-ANALYZED_EKONOMI      = "analyzed_ekonomi.csv"
-RESULTS_SERANGAN      = "results_serangan.json"
-RESULTS_EKONOMI       = "results_ekonomi.json"
-COMBINED_RESULTS      = "sentiment_results.json"   # untuk dashboard
+    return {"frames": frames, "match_details": match_details}
 
 
-# ─── YOUTUBE CRAWLER ──────────────────────────────────────────────────────────
+def _match_phrases(text: str, patterns: list) -> list:
+    """Helper: jalankan semua regex pattern, kembalikan list pattern yang match."""
+    matched = []
+    for pattern in patterns:
+        try:
+            m = re.search(pattern, text, re.IGNORECASE)
+            if m:
+                matched.append(m.group(0))
+        except re.error as e:
+            logging.warning(f"Regex error pada pattern '{pattern}': {e}")
+    return matched
 
-def get_youtube_client():
+# ══════════════════════════════════════════════════════════════════════════════
+# LANGUAGE DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+def is_indonesian(text: str) -> bool:
+    """
+    Deteksi bahasa Indonesia.
+    Mengembalikan True jika terdeteksi sebagai 'id'.
+    Catatan: langdetect bisa false positive untuk teks sangat pendek.
+    Teks < 15 karakter dikecualikan untuk mengurangi noise.
+    """
+    if len(text.strip()) < 15:
+        return False
     try:
-        from googleapiclient.discovery import build
-        return build("youtube", "v3", developerKey=API_KEY)
-    except ImportError:
-        print("❌  pip install google-api-python-client")
-        return None
-    except Exception as e:
-        print(f"❌  YouTube client error: {e}")
-        return None
+        return detect(text) == "id"
+    except LangDetectException:
+        return False
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SENTIMENT (metadata opsional — bukan output utama)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def get_sentiment_metadata(text: str) -> dict:
+    """
+    VADER + TextBlob sebagai metadata tambahan, bukan output inti.
+    Catatan metodologis: keduanya dioptimalkan untuk Bahasa Inggris.
+    Hasil untuk Bahasa Indonesia informal (campur kode, singkatan, emoji)
+    tidak akurat — gunakan hanya sebagai referensi, bukan kesimpulan.
+    Mengembalikan dict kosong jika library tidak tersedia.
+    """
+    if not SENTIMENT_AVAILABLE:
+        return {}
+    vader = SentimentIntensityAnalyzer()
+    vs = vader.polarity_scores(text)
+    tb = TextBlob(text).sentiment.polarity
+    ensemble = (vs["compound"] + tb) / 2
+    label = "positif" if ensemble > 0.05 else "negatif" if ensemble < -0.05 else "netral"
+    return {
+        "vader_compound": round(vs["compound"], 4),
+        "textblob_polarity": round(tb, 4),
+        "ensemble_score": round(ensemble, 4),
+        "sentiment_label": label,
+        "catatan": "METADATA SAJA — tidak akurat untuk Bahasa Indonesia informal",
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# YOUTUBE API CRAWLER
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_youtube_client():
+    api_key = CONFIG["api_key"]
+    if not api_key:
+        raise ValueError("YOUTUBE_API_KEY belum diset. Export env var atau isi CONFIG['api_key'].")
+    return googleapiclient.discovery.build("youtube", "v3", developerKey=api_key)
 
 
-def search_videos_in_channel(youtube, channel_id: str, channel_name: str,
-                              query: str, max_results: int = 3) -> list:
-    """Cari video di dalam satu kanal Indonesia spesifik."""
+def fetch_videos(youtube, channel_id: str, query: str, module_id: str) -> list[dict]:
+    """
+    Ambil video dari channel tertentu dalam event window modul.
+    Menggunakan publishedAfter + publishedBefore untuk filtering waktu.
+    """
+    mod = CONFIG["modules"][module_id]
     try:
         resp = youtube.search().list(
-            q=query,
-            part="id,snippet",
+            part="snippet",
             channelId=channel_id,
-            maxResults=max_results,
+            q=query,
             type="video",
-            order="date",          # terbaru dulu — relevan untuk kejadian 2026
+            order="relevance",
+            maxResults=CONFIG["max_results_per_query"],
+            publishedAfter=mod["window_start"],
+            publishedBefore=mod["window_end"],
         ).execute()
     except Exception as e:
-        print(f"    ⚠️  Search error [{channel_name}] '{query}': {e}")
+        logging.error(f"Error fetching videos untuk '{query}' di channel {channel_id}: {e}")
         return []
 
-    return [
-        {
+    videos = []
+    for item in resp.get("items", []):
+        videos.append({
             "video_id":    item["id"]["videoId"],
-            "title":       item["snippet"]["title"],
-            "channel":     item["snippet"]["channelTitle"],
-            "channel_id":  channel_id,
+            "video_title": item["snippet"]["title"],
             "published_at": item["snippet"]["publishedAt"],
-            "query":       query,
-        }
-        for item in resp.get("items", [])
-        if item["id"].get("videoId")
-    ]
+            "channel_name": item["snippet"]["channelTitle"],
+        })
+    return videos
 
 
-def search_videos(youtube, query: str, max_results: int = 5,
-                  relevance_language: str = "id") -> list:
-    """Fallback: search global (tidak dipakai di Opsi B)."""
+def fetch_comments(youtube, video_id: str) -> list[dict]:
+    """Ambil komentar top-level dari video."""
+    comments = []
     try:
-        resp = youtube.search().list(
-            q=query, part="id,snippet", maxResults=max_results,
-            type="video", order="relevance", relevanceLanguage=relevance_language,
+        resp = youtube.commentThreads().list(
+            part="snippet",
+            videoId=video_id,
+            maxResults=CONFIG["max_comments_per_video"],
+            textFormat="plainText",
+            order="relevance",
         ).execute()
+        for item in resp.get("items", []):
+            s = item["snippet"]["topLevelComment"]["snippet"]
+            comments.append({
+                "comment_id":   item["id"],
+                "original_text": s["textDisplay"],
+                "published_at": s["publishedAt"],
+            })
     except Exception as e:
-        print(f"  ⚠️  Search error '{query}': {e}")
-        return []
-    return [
-        {"video_id": item["id"]["videoId"], "title": item["snippet"]["title"],
-         "channel": item["snippet"]["channelTitle"],
-         "published_at": item["snippet"]["publishedAt"], "query": query}
-        for item in resp.get("items", []) if item["id"].get("videoId")
-    ]
-
-
-def get_comments(youtube, video_id: str, max_comments: int = 300) -> list:
-    """Ambil komentar top-level. Prioritaskan relevance (banyak likes)."""
-    comments, next_token = [], None
-    try:
-        while len(comments) < max_comments:
-            resp = youtube.commentThreads().list(
-                part="snippet",
-                videoId=video_id,
-                maxResults=min(100, max_comments - len(comments)),
-                pageToken=next_token,
-                textFormat="plainText",
-                order="relevance",
-            ).execute()
-
-            for item in resp.get("items", []):
-                sn = item["snippet"]["topLevelComment"]["snippet"]
-                comments.append({
-                    "video_id":    video_id,
-                    "comment_id":  item["id"],
-                    "text":        sn["textDisplay"],
-                    "author":      sn["authorDisplayName"],
-                    "like_count":  sn["likeCount"],
-                    "published_at": sn["publishedAt"],
-                    "reply_count": item["snippet"]["totalReplyCount"],
-                })
-
-            next_token = resp.get("nextPageToken")
-            if not next_token:
-                break
-    except Exception:
-        pass
+        logging.warning(f"Komentar tidak bisa diambil untuk video {video_id}: {e}")
     return comments
 
+# ══════════════════════════════════════════════════════════════════════════════
+# PROSES SATU KOMENTAR
+# ══════════════════════════════════════════════════════════════════════════════
 
-def crawl(channel_queries: list, label: str) -> list:
+def process_comment(comment: dict, video_meta: dict, module_id: str) -> dict | None:
     """
-    Opsi B: Crawl dari kanal Indonesia spesifik.
-    channel_queries = QUERIES_PER_CHANNEL_SERANGAN atau QUERIES_PER_CHANNEL_EKONOMI
-    Setiap query dijalankan di setiap kanal dalam INDONESIAN_CHANNELS.
+    Proses satu komentar:
+    1. Deteksi bahasa — skip jika bukan Indonesia
+    2. Preprocessing
+    3. Entity detection
+    4. Frame detection (multi-label)
+    5. Sentiment metadata (opsional)
+
+    Mengembalikan None jika komentar bukan bahasa Indonesia.
     """
-    youtube = get_youtube_client()
-    if not youtube:
-        return []
+    original = comment["original_text"]
 
-    all_comments, seen_vids, seen_ids = [], set(), set()
-    print(f"\n🔍  [{label}] Crawl {len(INDONESIAN_CHANNELS)} kanal × {len(channel_queries)} query…\n")
+    if not is_indonesian(original):
+        return None
 
-    for ch_name, ch_id in INDONESIAN_CHANNELS.items():
-        print(f"  📺  {ch_name}")
-        ch_videos = []
+    cleaned = preprocess(original)
+    entities = detect_entities(cleaned)
+    frame_result = detect_frames(cleaned, original)
+    sentiment = get_sentiment_metadata(original) if SENTIMENT_AVAILABLE else {}
 
-        for query in channel_queries:
-            videos = search_videos_in_channel(
-                youtube, ch_id, ch_name, query, MAX_VIDEOS_PER_CHANNEL_QUERY
-            )
-            for v in videos:
-                if v["video_id"] not in seen_vids:
-                    seen_vids.add(v["video_id"])
-                    ch_videos.append(v)
-            time.sleep(0.3)
-
-        print(f"       {len(ch_videos)} video unik ditemukan")
-
-        for v in ch_videos:
-            print(f"       🎬  {v['title'][:65]}")
-            comments = get_comments(youtube, v["video_id"], MAX_COMMENTS_PER_VIDEO)
-            for c in comments:
-                if c["comment_id"] not in seen_ids:
-                    seen_ids.add(c["comment_id"])
-                    c["video_title"]  = v["title"]
-                    c["channel"]      = ch_name
-                    c["channel_id"]   = ch_id
-                    c["search_query"] = v["query"]
-                    c["query_lang"]   = "id"
-                    all_comments.append(c)
-            print(f"            → {len(comments)} komentar (total: {len(all_comments)})")
-            time.sleep(0.5)
-
-        time.sleep(1)
-
-    print(f"\n✅  [{label}] {len(all_comments)} komentar unik terkumpul\n")
-    return all_comments
-
-
-# ─── NLP HELPERS ──────────────────────────────────────────────────────────────
-
-_vader = None
-def get_vader():
-    global _vader
-    if _vader is None:
-        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
-        _vader = SentimentIntensityAnalyzer()
-    return _vader
-
-
-def detect_language(text: str) -> str:
-    try:
-        from langdetect import detect
-        return detect(text)
-    except Exception:
-        return "unknown"
-
-
-def vader_sentiment(text: str) -> dict:
-    try:
-        sc = get_vader().polarity_scores(text)
-        c  = sc["compound"]
-        return {"vader_compound": c, "vader_pos": sc["pos"],
-                "vader_neg": sc["neg"], "vader_neu": sc["neu"],
-                "vader_label": "positive" if c>=0.05 else "negative" if c<=-0.05 else "neutral"}
-    except Exception:
-        return {"vader_compound":0,"vader_pos":0,"vader_neg":0,"vader_neu":1,"vader_label":"neutral"}
-
-
-def textblob_sentiment(text: str) -> dict:
-    try:
-        from textblob import TextBlob
-        b = TextBlob(text)
-        p, s = b.sentiment.polarity, b.sentiment.subjectivity
-        return {"tb_polarity": p, "tb_subjectivity": s,
-                "tb_label": "positive" if p>0.05 else "negative" if p<-0.05 else "neutral"}
-    except Exception:
-        return {"tb_polarity":0,"tb_subjectivity":0,"tb_label":"neutral"}
-
-
-def detect_entities(text: str, entity_dict: dict) -> dict:
-    """Deteksi mention entitas. Return {entity: True/False}."""
-    t = text.lower()
-    return {ent: any(kw in t for kw in kws) for ent, kws in entity_dict.items()}
-
-
-def detect_tones(text: str) -> dict:
-    """Deteksi tone komentar Indonesia. Return {tone: True/False}."""
-    t = text.lower()
-    return {tone: any(kw in t for kw in kws) for tone, kws in TONE_PATTERNS.items()}
-
-
-def classify_comment_type(tones: dict, lang: str) -> str:
-    """
-    Klasifikasikan komentar ke dalam salah satu tipe.
-
-    HIERARKI KLASIFIKASI MODUL A:
-    ─────────────────────────────────────────────────────────────
-    JERNIH:
-      jernih_diplomatik  → melihat Iran sebagai negara berdaulat,
-                           bicara hukum internasional / geopolitik
-      jernih_kemanusiaan → solidaritas tanpa frame sektarian,
-                           tidak mempermasalahkan Syiah/Sunni
-
-    DIKOTOMI:
-      dikotomi_syiah     → eksplisit mempermasalahkan ke-Syiah-an Iran
-      solidaritas_buta   → membela Iran KARENA label Islam/Muslim,
-                           tanpa analisis substansial
-
-    LAIN:
-      analitis           → berbasis data/fakta tapi tidak termasuk
-                           kerangka jernih di atas
-      reaktif            → kemarahan emosional murni
-      ekonomi_lokal      → menyentuh dampak ke Indonesia
-      netral             → tidak terklasifikasi
-    ─────────────────────────────────────────────────────────────
-    """
-    # Jernih: prioritas tertinggi — meski ada elemen lain
-    if tones.get("jernih_diplomatik"):
-        return "jernih_diplomatik"
-    if tones.get("jernih_kemanusiaan") and not tones.get("dikotomi_syiah"):
-        return "jernih_kemanusiaan"
-
-    # Dikotomi sektarian
-    if tones.get("dikotomi_syiah"):
-        return "dikotomi_syiah"
-    if tones.get("solidaritas_buta") and not tones.get("jernih_kemanusiaan"):
-        return "solidaritas_buta"
-
-    # Analitis umum
-    if tones.get("analitis"):
-        return "analitis"
-
-    # Lain-lain
-    if tones.get("reaktif_emosional"):
-        return "reaktif"
-    if tones.get("nuansa_ekonomi_lokal"):
-        return "ekonomi_lokal"
-    return "netral"
-
-
-# ─── PIPELINE UTAMA ───────────────────────────────────────────────────────────
-
-def analyze(comments: list, entity_dict: dict, label: str) -> tuple:
-    print(f"🧠  [{label}] Analisis NLP {len(comments)} komentar…")
-
-    results = []
-    entity_stats = defaultdict(lambda: {
-        "positive":0,"negative":0,"neutral":0,"total":0,
-        "scores":[],"id_comments":0
-    })
-
-    comment_types = defaultdict(int)
-    id_comment_types = defaultdict(int)
-
-    for i, c in enumerate(comments):
-        if i % 300 == 0:
-            print(f"    {i}/{len(comments)}…")
-
-        text = c.get("text","").strip()
-        if len(text) < 5:
-            continue
-
-        vader  = vader_sentiment(text)
-        tb     = textblob_sentiment(text)
-        lang   = detect_language(text)
-        ents   = detect_entities(text, entity_dict)
-        tones  = detect_tones(text)
-        ctype  = classify_comment_type(tones, lang)
-
-        ens_score = round((vader["vader_compound"] + tb["tb_polarity"]) / 2, 4)
-        ens_label = "positive" if ens_score>=0.05 else "negative" if ens_score<=-0.05 else "neutral"
-
-        is_id = lang == "id"
-
-        row = {
-            **c,
-            **vader, **tb,
-            "language": lang,
-            "is_indonesian": is_id,
-            "ensemble_score": ens_score,
-            "ensemble_label": ens_label,
-            "comment_type": ctype,
-            **{f"tone_{k}": v for k,v in tones.items()},
-            **{f"ent_{k}": v for k,v in ents.items()},
-        }
-        results.append(row)
-
-        comment_types[ctype] += 1
-        if is_id:
-            id_comment_types[ctype] += 1
-
-        for ent, mentioned in ents.items():
-            if mentioned:
-                entity_stats[ent][ens_label] += 1
-                entity_stats[ent]["total"]   += 1
-                entity_stats[ent]["scores"].append(ens_score)
-                if is_id:
-                    entity_stats[ent]["id_comments"] += 1
-
-    print(f"  ✅  Selesai — {len(results)} komentar dianalisis\n")
-    return results, dict(entity_stats), dict(comment_types), dict(id_comment_types)
-
-
-def build_report(results, entity_stats, comment_types, id_comment_types,
-                 module_label, module_desc, queries_used):
-    if not results:
-        return {
-            "module": module_label, "description": module_desc,
-            "generated_at": datetime.now().isoformat(),
-            "queries_used": queries_used,
-            "total_comments": 0, "indonesian_comments": 0,
-            "english_comments": 0,
-            "overall_sentiment": {"positive":0,"negative":0,"neutral":0},
-            "indonesian_sentiment": {"positive":0,"negative":0,"neutral":0},
-            "comment_type_distribution": {},
-            "indonesian_comment_type_distribution": {},
-            "entities": {}, "language_distribution": {},
-            "top_comments": {}, "top_indonesian_comments": {},
-            "error": "No comments collected — check channel IDs and queries.",
-        }
-
-    df = pd.DataFrame(results)
-
-    id_df = df[df["is_indonesian"] == True] if "is_indonesian" in df.columns else pd.DataFrame()
-    en_df = df[df["language"] == "en"] if "language" in df.columns else pd.DataFrame()
-
-    def calc_actor(stats):
-        out = {}
-        for ent, s in stats.items():
-            scores = s.pop("scores", [])
-            total  = max(s["total"], 1)
-            avg    = round(sum(scores)/len(scores), 4) if scores else 0
-            out[ent] = {
-                **s,
-                "avg_sentiment_score": avg,
-                "sentiment_ratio": {
-                    "positive_pct": round(s["positive"]/total*100, 1),
-                    "negative_pct": round(s["negative"]/total*100, 1),
-                    "neutral_pct":  round(s["neutral"]/total*100, 1),
-                },
-            }
-        return out
-
-    report = {
-        "module":        module_label,
-        "description":   module_desc,
-        "generated_at":  datetime.now().isoformat(),
-        "queries_used":  queries_used,
-        "total_comments": len(results),
-        "indonesian_comments": int(df["is_indonesian"].sum()),
-        "english_comments": int((df["language"]=="en").sum()),
-        "overall_sentiment": {
-            "positive": int((df["ensemble_label"]=="positive").sum()),
-            "negative": int((df["ensemble_label"]=="negative").sum()),
-            "neutral":  int((df["ensemble_label"]=="neutral").sum()),
-        },
-        "indonesian_sentiment": {
-            "positive": int((id_df["ensemble_label"]=="positive").sum()) if len(id_df)>0 else 0,
-            "negative": int((id_df["ensemble_label"]=="negative").sum()) if len(id_df)>0 else 0,
-            "neutral":  int((id_df["ensemble_label"]=="neutral").sum())  if len(id_df)>0 else 0,
-        },
-        "comment_type_distribution": comment_types,
-        "indonesian_comment_type_distribution": id_comment_types,
-        "entities": calc_actor(entity_stats),
-        "language_distribution": df["language"].value_counts().head(15).to_dict(),
-        "top_comments": _top_comments(df),
-        "top_indonesian_comments": _top_comments(id_df) if len(id_df)>0 else {},
+    return {
+        # Identifikasi sumber
+        "module_name":    module_id,
+        "video_id":       video_meta["video_id"],
+        "video_title":    video_meta["video_title"],
+        "channel_name":   video_meta["channel_name"],
+        "published_at":   comment.get("published_at", ""),
+        "comment_id":     comment["comment_id"],
+        # Teks
+        "original_text":  original,
+        "cleaned_text":   cleaned,
+        # Analisis
+        "detected_entities":      json.dumps(entities, ensure_ascii=False),
+        "detected_frames":        json.dumps(frame_result["frames"], ensure_ascii=False),
+        "frame_match_details":    json.dumps(frame_result["match_details"], ensure_ascii=False),
+        # Metadata sentimen (opsional)
+        "sentiment_vader":        sentiment.get("vader_compound", ""),
+        "sentiment_textblob":     sentiment.get("textblob_polarity", ""),
+        "sentiment_ensemble":     sentiment.get("ensemble_score", ""),
+        "sentiment_label":        sentiment.get("sentiment_label", ""),
+        # Bahasa
+        "detected_as_indonesian": True,
     }
-    return report
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AGREGASI & RINGKASAN
+# ══════════════════════════════════════════════════════════════════════════════
+
+def build_summary(results: list[dict]) -> dict:
+    """
+    Bangun ringkasan agregat dari semua hasil:
+    - Jumlah per frame
+    - Jumlah per entitas
+    - Cross-tab entity × frame
+    - Contoh komentar representatif per frame
+    - Perbandingan Modul A vs Modul B
+    """
+    frame_count = defaultdict(int)
+    entity_count = defaultdict(int)
+    entity_frame_crosstab = defaultdict(lambda: defaultdict(int))
+    frame_examples = defaultdict(list)
+    module_counts = defaultdict(lambda: defaultdict(int))
+
+    for r in results:
+        mod = r["module_name"]
+        frames = json.loads(r["detected_frames"])
+        entities = json.loads(r["detected_entities"])
+
+        for f in frames:
+            frame_count[f] += 1
+            module_counts[mod][f] += 1
+            if len(frame_examples[f]) < 5:
+                frame_examples[f].append({
+                    "text":    r["original_text"][:200],
+                    "module":  mod,
+                    "video":   r["video_title"][:80],
+                    "channel": r["channel_name"],
+                })
+
+        for e in entities:
+            entity_count[e] += 1
+            for f in frames:
+                entity_frame_crosstab[e][f] += 1
+
+    return {
+        "total_indonesian_comments": len(results),
+        "frame_distribution": dict(frame_count),
+        "entity_distribution": dict(entity_count),
+        "entity_frame_crosstab": {k: dict(v) for k, v in entity_frame_crosstab.items()},
+        "frame_examples": {k: v for k, v in frame_examples.items()},
+        "comparison_by_module": {k: dict(v) for k, v in module_counts.items()},
+    }
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AUDIT / EVALUASI MANUAL
+# ══════════════════════════════════════════════════════════════════════════════
+
+def export_audit_sample(results: list[dict], module_id: str, out_dir: str):
+    """
+    Ekspor sample untuk audit manual.
+    Prioritaskan komentar dengan frame sektarian_syiah_sunni (perlu audit wajib).
+    Lengkapi dengan random sample.
+    """
+    sektarian = [r for r in results if r["module_name"] == module_id
+                 and "sektarian_syiah_sunni" in r["detected_frames"]]
+    others    = [r for r in results if r["module_name"] == module_id
+                 and "sektarian_syiah_sunni" not in r["detected_frames"]]
+
+    random.shuffle(others)
+    n = CONFIG["audit_sample_size"]
+    # Selalu sertakan semua sektarian, sisanya dari others
+    sample = sektarian + others[:max(0, n - len(sektarian))]
+    sample = sample[:n]
+
+    filepath = os.path.join(out_dir, f"audit_modul_{module_id}.csv")
+    cols = ["comment_id","original_text","detected_frames","frame_match_details",
+            "detected_entities","video_title","channel_name","published_at",
+            # Kolom audit manual — diisi oleh peneliti
+            "audit_frame_manual","audit_benar_salah","audit_catatan"]
+
+    with open(filepath, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=cols, extrasaction="ignore")
+        w.writeheader()
+        for r in sample:
+            w.writerow({**r, "audit_frame_manual": "", "audit_benar_salah": "", "audit_catatan": ""})
+
+    logging.info(f"Audit sample Modul {module_id}: {len(sample)} komentar → {filepath}")
+    print(f"\n⚠️  AUDIT WAJIB: File audit Modul {module_id} tersimpan di {filepath}")
+    print(f"   {len(sektarian)} komentar dengan flag sektarian_syiah_sunni termasuk dalam sample.")
+    print(f"   Kolom 'audit_frame_manual', 'audit_benar_salah', 'audit_catatan' diisi manual peneliti.")
 
 
-def _top_comments(df):
-    """Top 3 positif & negatif per entitas."""
-    if df is None or len(df) == 0:
+def compute_audit_metrics(audit_filepath: str) -> dict:
+    """
+    Baca file audit yang sudah diisi manual.
+    Hitung precision indikatif per frame.
+    Jalankan fungsi ini setelah audit manual selesai.
+    """
+    if not os.path.exists(audit_filepath):
+        print(f"File audit tidak ditemukan: {audit_filepath}")
         return {}
-    out = {}
-    ent_cols = [c for c in df.columns if c.startswith("ent_")]
-    for col in ent_cols:
-        ent_name = col.replace("ent_","")
-        adf = df[df[col]==True]
-        if len(adf) == 0:
-            continue
-        cols = [c for c in ["text","ensemble_score","like_count","language","comment_type"] if c in adf.columns]
-        out[ent_name] = {
-            "most_positive": adf.nlargest(3,"ensemble_score")[cols].to_dict("records"),
-            "most_negative": adf.nsmallest(3,"ensemble_score")[cols].to_dict("records"),
-        }
-    return out
 
+    correct = defaultdict(int)
+    total   = defaultdict(int)
+    fp_examples = defaultdict(list)
+    fn_examples = defaultdict(list)
 
-# ─── DEMO DATA ────────────────────────────────────────────────────────────────
+    with open(audit_filepath, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if not row.get("audit_benar_salah"):
+                continue
+            frames = json.loads(row["detected_frames"])
+            is_correct = row["audit_benar_salah"].strip().lower() in ("y","ya","benar","1","true")
+            for fr in frames:
+                total[fr] += 1
+                if is_correct:
+                    correct[fr] += 1
+                else:
+                    fp_examples[fr].append(row["original_text"][:100])
 
-def make_demo_data_serangan(n=400):
-    import random
-    templates = [
-        # Indonesian — identitas agama
-        ("Innalillahi, saudara kita di Iran syahid oleh kekejaman Israel dan Amerika!", -0.55, "id"),
-        ("Khamenei memang syiah tapi tetap saudara seiman, doa kami menyertai Iran", -0.2, "id"),
-        ("Yang meninggal bukan cuma syiah, ada warga sipil tak berdosa juga", -0.6, "id"),
-        ("Sebagai Muslim Sunni saya menolak syiah tapi juga menolak pembunuhan ini", -0.4, "id"),
-        ("Syiah atau Sunni bukan urusannya, ini tentang kedaulatan negara", 0.1, "id"),
-        ("Amerika dan Israel biadab, membunuh pemimpin negara berdaulat!", -0.7, "id"),
-        ("Iran harus kena karma karena mendukung Hizbullah teror", -0.3, "id"),
-        ("Analisis saya: ini bagian dari strategi AS untuk destabilisasi Timur Tengah sebelum pemilu", 0.0, "id"),
-        ("Kita tidak perlu membela Iran hanya karena sesama Muslim, harus objektif", 0.1, "id"),
-        ("Khamenei bukan perwakilan Islam, dia pemimpin negara Iran saja", 0.0, "id"),
-        # Indonesian — analitis
-        ("Secara geopolitik, kematian Khamenei akan menciptakan kekosongan kekuasaan yang berbahaya", -0.2, "id"),
-        ("Data menunjukkan Iran sudah lemah secara ekonomi sebelum serangan ini", 0.1, "id"),
-        ("Pertanyaan pentingnya: siapa yang akan gantikan Khamenei dan apa dampaknya ke OPEC?", 0.0, "id"),
-        # English — internasional
-        ("The killing of Khamenei is illegal under international law", -0.5, "en"),
-        ("Good, one less terrorist leader in the world", 0.5, "en"),
-        ("This will destabilize the whole region", -0.6, "en"),
-        ("Iran asked for this by supporting Hamas and Hezbollah", 0.2, "en"),
-        ("Russia and China will not let Iran fall, watch the next move", 0.0, "en"),
-        ("China is watching carefully, Taiwan might be next on their mind", -0.1, "en"),
-        ("Putin will use this to distract from Ukraine", -0.3, "en"),
-    ]
-    results = []
-    for i in range(n):
-        text, score, lang = random.choice(templates)
-        noise = random.uniform(-0.1, 0.1)
-        results.append({
-            "video_id": f"demo_{random.randint(1,15)}",
-            "comment_id": f"demo_s_{i}",
-            "text": text,
-            "author": f"User_{random.randint(1000,9999)}",
-            "like_count": random.randint(0, 300),
-            "published_at": f"2026-02-{random.randint(28,28)}T{random.randint(0,23):02d}:00:00Z",
-            "reply_count": random.randint(0, 30),
-            "video_title": f"Israel serang Iran Khamenei tewas vol{random.randint(1,8)}",
-            "channel": random.choice(["Kompas TV","CNN Indonesia","tvOne","Narasi","Metro TV"]),
-            "search_query": random.choice(QUERIES_SERANGAN[:4]),
-            "query_lang": lang,
-        })
-    return results
+    precision = {fr: round(correct[fr] / total[fr], 3) if total[fr] else None
+                 for fr in total}
+    return {
+        "precision_per_frame": precision,
+        "false_positive_examples": {k: v[:3] for k, v in fp_examples.items()},
+        "catatan": "Precision indikatif — bukan evaluasi formal. Sample size kecil, hasil tidak representatif secara statistik.",
+    }
 
+# ══════════════════════════════════════════════════════════════════════════════
+# EXPORT
+# ══════════════════════════════════════════════════════════════════════════════
 
-def make_demo_data_ekonomi(n=400):
-    import random
-    templates = [
-        # Indonesian — nuansa ekonomi lokal
-        ("BBM pasti naik lagi gara-gara selat hormuz ditutup, rakyat kecil yang kena", -0.6, "id"),
-        ("Pertamina harus antisipasi ini, cadangan minyak kita terbatas!", -0.4, "id"),
-        ("Harga bensin Indonesia pasti naik, pemerintah harus subsidi!", -0.5, "id"),
-        ("Dampaknya ke IHSG sudah keliatan, saham energi naik tapi manufaktur turun", -0.1, "id"),
-        ("Indonesia sebagai net importer minyak paling terdampak di ASEAN", -0.3, "id"),
-        ("Kita perlu percepat energi terbarukan, ini bukti ketergantungan minyak bahaya", -0.1, "id"),
-        ("Rupiah pasti melemah kalau harga minyak dunia terus naik", -0.4, "id"),
-        # Indonesian — penonton konflik (tanpa nuansa ekonomi lokal)
-        ("Iran tutup selat hormuz, Amerika pasti panik!", 0.2, "id"),
-        ("Bagus! Iran kasih pelajaran ke Amerika dengan tutup hormuz!", 0.5, "id"),
-        ("Iran kuat! Tutup hormuz bikin barat kelimpungan hahaha", 0.4, "id"),
-        ("Doa kita untuk Iran, semoga kuat menghadapi blokade ekonomi Barat", -0.1, "id"),
-        # English
-        ("Oil at $200 is going to crash the global economy", -0.7, "en"),
-        ("China has been stockpiling oil for this exact scenario", 0.1, "en"),
-        ("Russia benefits enormously from higher oil prices", 0.3, "en"),
-        ("The Hormuz closure is Iran's last economic weapon", 0.0, "en"),
-        ("US strategic petroleum reserve will be deployed immediately", 0.1, "en"),
-        ("This is why energy independence matters", 0.0, "en"),
-        ("Saudi Arabia will increase production to compensate", 0.2, "en"),
-    ]
-    results = []
-    for i in range(n):
-        text, score, lang = random.choice(templates)
-        noise = random.uniform(-0.1, 0.1)
-        results.append({
-            "video_id": f"demo_e{random.randint(1,15)}",
-            "comment_id": f"demo_e_{i}",
-            "text": text,
-            "author": f"User_{random.randint(1000,9999)}",
-            "like_count": random.randint(0, 200),
-            "published_at": f"2026-03-{random.randint(10,13)}T{random.randint(0,23):02d}:00:00Z",
-            "reply_count": random.randint(0, 20),
-            "video_title": f"Iran tutup selat hormuz harga minyak naik vol{random.randint(1,6)}",
-            "channel": random.choice(["Kompas TV","CNN Indonesia","CNBC Indonesia","Bloomberg","Reuters"]),
-            "search_query": random.choice(QUERIES_EKONOMI[:4]),
-            "query_lang": lang,
-        })
-    return results
+CSV_COLUMNS = [
+    "module_name", "video_id", "video_title", "channel_name", "published_at",
+    "comment_id", "original_text", "cleaned_text",
+    "detected_entities", "detected_frames", "frame_match_details",
+    "sentiment_vader", "sentiment_textblob", "sentiment_ensemble", "sentiment_label",
+    "detected_as_indonesian",
+]
 
+def export_results(results: list[dict], summary: dict, out_dir: str):
+    os.makedirs(out_dir, exist_ok=True)
 
-# ─── MAIN ─────────────────────────────────────────────────────────────────────
+    # 1. CSV komentar level
+    csv_path = os.path.join(out_dir, "discourse_results.csv")
+    with open(csv_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=CSV_COLUMNS, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(results)
+    logging.info(f"CSV: {csv_path} ({len(results)} baris)")
 
-def main():
-    print("=" * 65)
-    print("  🇮🇩  YouTube Sentiment Analyzer — Perspektif Indonesia")
-    print("  Modul A: Serangan Israel-USA ke Iran (Feb 28, 2026)")
-    print("  Modul B: Penutupan Selat Hormuz (Mar 10, 2026)")
-    print("=" * 65)
+    # 2. JSON agregat
+    json_path = os.path.join(out_dir, "summary.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    logging.info(f"JSON summary: {json_path}")
 
-    demo_mode = not bool(API_KEY)
-    if demo_mode:
-        print("\n⚠️   Demo mode (tidak ada YOUTUBE_API_KEY).\n")
+    # 3. File ringkasan readable (teks)
+    txt_path = os.path.join(out_dir, "ringkasan.txt")
+    with open(txt_path, "w", encoding="utf-8") as f:
+        f.write("=" * 70 + "\n")
+        f.write("RINGKASAN ANALISIS DISCOURSE PUBLIK INDONESIA\n")
+        f.write("Konflik Iran–Israel–USA | Frame-Aware Discourse Analyzer\n")
+        f.write("=" * 70 + "\n\n")
 
-    # ── MODUL A ──
-    print("\n" + "─"*65)
-    print("  MODUL A: SERANGAN")
-    print("─"*65)
-    raw_a = crawl(QUERIES_PER_CHANNEL_SERANGAN, "SERANGAN") if not demo_mode else make_demo_data_serangan(400)
+        f.write("⚠️  WARNING METODOLOGIS:\n")
+        f.write("  1. Komentar YouTube TIDAK mewakili seluruh opini publik Indonesia.\n")
+        f.write("  2. Distribusi komentar dipengaruhi algoritma platform & pemilihan video.\n")
+        f.write("  3. Rule-based frame detection adalah INDIKASI AWAL, bukan ground truth.\n")
+        f.write("  4. Label sektarian_syiah_sunni WAJIB dicek manual sebelum klaim akademik.\n")
+        f.write("  5. Sentiment VADER/TextBlob adalah metadata tambahan — tidak akurat untuk\n")
+        f.write("     Bahasa Indonesia informal.\n\n")
 
-    pd.DataFrame(raw_a).to_csv(RAW_OUTPUT_SERANGAN, index=False, encoding="utf-8")
-    print(f"💾  Raw → {RAW_OUTPUT_SERANGAN}")
+        f.write(f"Total komentar Indonesia: {summary['total_indonesian_comments']}\n\n")
 
-    res_a, estats_a, ctypes_a, id_ctypes_a = analyze(raw_a, ENTITIES_SERANGAN, "SERANGAN")
-    pd.DataFrame(res_a).to_csv(ANALYZED_SERANGAN, index=False, encoding="utf-8")
+        f.write("DISTRIBUSI FRAME:\n")
+        for frame, count in sorted(summary["frame_distribution"].items(), key=lambda x: -x[1]):
+            note = LEXICON.get(frame, {}).get("note", "")
+            f.write(f"  {frame:35s} {count:4d}   {note}\n")
+        f.write("\n")
 
-    report_a = build_report(res_a, estats_a, ctypes_a, id_ctypes_a,
-                            "A_SERANGAN",
-                            "Sentimen publik Indonesia atas serangan Israel-USA ke Iran. Fokus: apakah komentar Indonesia bisa jernih melihat (hubungan diplomatik, sesama Islam), atau terbawa dikotomi Khamenei/Syiah. Konteks: Indonesia mayoritas Muslim Sunni, non-Syiah.",
-                            QUERIES_SERANGAN)
-    with open(RESULTS_SERANGAN, "w", encoding="utf-8") as f:
-        json.dump(report_a, f, indent=2, ensure_ascii=False)
-    print(f"💾  Hasil → {RESULTS_SERANGAN}")
+        f.write("DISTRIBUSI ENTITAS:\n")
+        for ent, count in sorted(summary["entity_distribution"].items(), key=lambda x: -x[1]):
+            f.write(f"  {ent:20s} {count:4d}\n")
+        f.write("\n")
 
-    # ── MODUL B ──
-    print("\n" + "─"*65)
-    print("  MODUL B: EKONOMI / SELAT HORMUZ")
-    print("─"*65)
-    raw_b = crawl(QUERIES_PER_CHANNEL_EKONOMI, "EKONOMI") if not demo_mode else make_demo_data_ekonomi(400)
+        f.write("PERBANDINGAN MODUL A vs B:\n")
+        for mod, frames in summary["comparison_by_module"].items():
+            mod_name = CONFIG["modules"].get(mod, {}).get("name", mod)
+            f.write(f"\n  Modul {mod} — {mod_name}:\n")
+            for fr, cnt in sorted(frames.items(), key=lambda x: -x[1]):
+                f.write(f"    {fr:35s} {cnt:4d}\n")
+        f.write("\n")
 
-    pd.DataFrame(raw_b).to_csv(RAW_OUTPUT_EKONOMI, index=False, encoding="utf-8")
-    print(f"💾  Raw → {RAW_OUTPUT_EKONOMI}")
+        f.write("CONTOH KOMENTAR REPRESENTATIF PER FRAME:\n\n")
+        for frame, examples in summary["frame_examples"].items():
+            f.write(f"  [{frame}]\n")
+            for ex in examples[:3]:
+                f.write(f"    [{ex['channel']}] \"{ex['text'][:120]}\"\n")
+            f.write("\n")
 
-    res_b, estats_b, ctypes_b, id_ctypes_b = analyze(raw_b, ENTITIES_EKONOMI, "EKONOMI")
-    pd.DataFrame(res_b).to_csv(ANALYZED_EKONOMI, index=False, encoding="utf-8")
+    logging.info(f"Ringkasan: {txt_path}")
+    return csv_path, json_path, txt_path
 
-    report_b = build_report(res_b, estats_b, ctypes_b, id_ctypes_b,
-                            "B_EKONOMI",
-                            "Sentimen publik Indonesia atas penutupan Selat Hormuz. Fokus: apakah diskusi ekonomi substantif atau sekadar penonton konflik.",
-                            QUERIES_EKONOMI)
-    with open(RESULTS_EKONOMI, "w", encoding="utf-8") as f:
-        json.dump(report_b, f, indent=2, ensure_ascii=False)
-    print(f"💾  Hasil → {RESULTS_EKONOMI}")
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════════
 
-    # ── COMBINED untuk dashboard ──
-    combined = {"module_A": report_a, "module_B": report_b}
-    with open(COMBINED_RESULTS, "w", encoding="utf-8") as f:
-        json.dump(combined, f, indent=2, ensure_ascii=False)
-    print(f"💾  Combined → {COMBINED_RESULTS}")
+def run():
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)s  %(message)s")
+    out_dir = CONFIG["output_dir"]
+    os.makedirs(out_dir, exist_ok=True)
 
-    # ── SUMMARY ──
-    print("\n" + "="*65)
-    print("  📊  RINGKASAN")
-    print("="*65)
-    for label, report in [("SERANGAN", report_a), ("EKONOMI", report_b)]:
-        total = report["total_comments"]
-        id_n  = report["indonesian_comments"]
-        print(f"\n  [{label}]")
-        print(f"  Total komentar : {total}")
-        if total == 0:
-            print(f"  ⚠️  Tidak ada komentar — periksa channel ID di INDONESIAN_CHANNELS")
-            continue
-        print(f"  Komentar ID    : {id_n} ({round(id_n/max(total,1)*100,1)}%)")
-        print(f"  Tipe komentar Indonesia:")
-        for k,v in report.get("indonesian_comment_type_distribution",{}).items():
-            print(f"    {k:25s}: {v}")
+    youtube = build_youtube_client()
+    all_results = []
+    seen_comments = set()  # deduplifikasi antar query
 
-    print(f"\n✅  Selesai! Load {COMBINED_RESULTS} ke dashboard.\n")
-    return combined
+    # ── Iterasi modul × kanal × frame × query ────────────────────────────────
+    for module_id, queries_by_frame in CONFIG["queries"].items():
+        mod_name = CONFIG["modules"][module_id]["name"]
+        logging.info(f"\n{'='*60}")
+        logging.info(f"MODUL {module_id}: {mod_name}")
+        logging.info(f"Window: {CONFIG['modules'][module_id]['window_start']} → {CONFIG['modules'][module_id]['window_end']}")
+
+        for channel_name, channel_id in CONFIG["channels"].items():
+            logging.info(f"\n  Kanal: {channel_name}")
+
+            for frame_group, queries in queries_by_frame.items():
+                for query in queries:
+                    logging.info(f"    Query [{frame_group}]: {query}")
+                    videos = fetch_videos(youtube, channel_id, query, module_id)
+                    if not videos:
+                        continue
+
+                    for vid in videos:
+                        comments = fetch_comments(youtube, vid["video_id"])
+                        for raw_comment in comments:
+                            cid = raw_comment["comment_id"]
+                            if cid in seen_comments:
+                                continue
+                            seen_comments.add(cid)
+
+                            processed = process_comment(raw_comment, vid, module_id)
+                            if processed:
+                                all_results.append(processed)
+
+    logging.info(f"\nTotal komentar Indonesia: {len(all_results)}")
+
+    if not all_results:
+        logging.warning("Tidak ada komentar Indonesia yang berhasil diproses.")
+        return
+
+    # ── Summary & export ──────────────────────────────────────────────────────
+    summary = build_summary(all_results)
+    csv_p, json_p, txt_p = export_results(all_results, summary, out_dir)
+
+    # ── Audit sample per modul ────────────────────────────────────────────────
+    for module_id in CONFIG["modules"]:
+        export_audit_sample(all_results, module_id, out_dir)
+
+    print(f"\n{'='*60}")
+    print("SELESAI.")
+    print(f"  CSV komentar : {csv_p}")
+    print(f"  JSON summary : {json_p}")
+    print(f"  Ringkasan    : {txt_p}")
+    print(f"\n  File audit tersimpan di: {out_dir}/audit_modul_*.csv")
+    print("  Isi kolom audit_frame_manual + audit_benar_salah secara manual,")
+    print("  lalu jalankan: compute_audit_metrics('output/audit_modul_A.csv')")
+    print(f"{'='*60}\n")
 
 
 if __name__ == "__main__":
-    main()
+    run()
